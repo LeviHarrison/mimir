@@ -206,7 +206,7 @@ func (s *Promise) Wait() {
 		s.errMtx.Lock()
 		defer s.errMtx.Unlock()
 
-		s.err = errors.New("Timed out while waiting for forwarding request(s).")
+		s.err = errors.New("timed out while waiting for forwarding request(s)")
 	}
 }
 
