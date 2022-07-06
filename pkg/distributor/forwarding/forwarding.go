@@ -234,8 +234,8 @@ func (s *Promise) ErrorAsHttpGrpc() error {
 	return httpgrpc.Errorf(http.StatusBadRequest, err.Error())
 }
 
-// Done marks the promise as Done.
-func (s *Promise) Done() {
+// done marks the promise as done.
+func (s *Promise) done() {
 	close(s.doneCh)
 }
 
@@ -267,7 +267,7 @@ func (r *request) Send(ctx context.Context) *Promise {
 
 	// Early return if there's no data to send.
 	if len(r.tsByEndpoint) == 0 {
-		promise.Done()
+		promise.done()
 		return promise
 	}
 
@@ -286,7 +286,7 @@ func (r *request) Send(ctx context.Context) *Promise {
 
 	go func() {
 		defer r.cleanup()
-		defer promise.Done()
+		defer promise.done()
 
 		wg.Wait()
 	}()

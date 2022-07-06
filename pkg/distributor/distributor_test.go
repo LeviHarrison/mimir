@@ -2405,12 +2405,14 @@ func TestDistributor_IngestionIsControlledByForwarder(t *testing.T) {
 				forwarding:        true,
 			})
 
-			forwarder := setMockForwarder(distributors[0], tc.ingestSample)
+			var forwardReqCnt atomic.Uint32
+			forwardReqCallback := func() { forwardReqCnt.Inc() }
+			setMockForwarder(distributors[0], tc.ingestSample, forwardReqCallback)
 
 			response, err := distributors[0].Push(ctx, tc.request)
 			assert.NoError(t, err)
 			assert.Equal(t, emptyResponse, response)
-			assert.Equal(t, 1, int(forwarder.sendCount.Load()))
+			assert.Equal(t, 1, int(forwardReqCnt.Load()))
 
 			ingestedMetrics := getIngestedMetrics(ctx, t, &ingesters[0])
 			assert.Equal(t, tc.expectIngestedMetrics, ingestedMetrics)
@@ -2494,17 +2496,19 @@ func TestDistributor_ForwarderWithSlowTargets(t *testing.T) {
 				},
 			})
 
-			forwarder := setMockForwarder(distributors[0], true)
-			forwarder.sendCallback = func() {
+			var forwardReqCnt atomic.Uint32
+			forwardReqCallback := func() {
 				time.Sleep(tc.forwardingLatency)
+				forwardReqCnt.Inc()
 				ensureNotCleanedUp()
 			}
+			setMockForwarder(distributors[0], true, forwardReqCallback)
 
 			request := makeWriteRequest(123456789000, 5, 0, false, metric)
 			response, err := distributors[0].PushWithCleanup(ctx, request, cleanUp)
 			assert.NoError(t, err)
 			assert.Equal(t, emptyResponse, response)
-			assert.Equal(t, 1, int(forwarder.sendCount.Load()))
+			assert.Equal(t, 1, int(forwardReqCnt.Load()))
 
 			ingestedMetrics := getIngestedMetrics(ctx, t, &ingesters[0])
 			assert.Equal(t, []string{metric}, ingestedMetrics)
@@ -3565,53 +3569,9 @@ outer:
 	return true
 }
 
-func setMockForwarder(distributor *Distributor, ingest bool) *mockForwarder {
-	forwarder := newMockForwarder(ingest, nil)
+func setMockForwarder(distributor *Distributor, ingest bool, forwardReqCallback func()) {
+	forwarder := forwarding.NewMockForwarder(ingest, forwardReqCallback)
 	distributor.forwarder = forwarder
-	return forwarder
-}
-
-type mockForwarder struct {
-	ingest    bool
-	sendCount atomic.Uint32
-
-	// Callback to run in place of the actual forwarding request.
-	sendCallback func()
-}
-
-func newMockForwarder(ingest bool, sendCallback func()) *mockForwarder {
-	return &mockForwarder{
-		ingest:       ingest,
-		sendCallback: sendCallback,
-	}
-}
-
-func (m *mockForwarder) NewRequest(ctx context.Context, tenant string, _ validation.ForwardingRules) forwarding.Request {
-	return &mockForwardingRequest{forwarder: m}
-}
-
-type mockForwardingRequest struct {
-	forwarder *mockForwarder
-}
-
-func (m *mockForwardingRequest) Add(sample mimirpb.PreallocTimeseries) bool {
-	return m.forwarder.ingest
-}
-
-func (m *mockForwardingRequest) Send(ctx context.Context) *forwarding.Promise {
-	promise := forwarding.NewPromise(time.Second, true)
-
-	go func() {
-		defer promise.Done()
-
-		if m.forwarder.sendCallback != nil {
-			m.forwarder.sendCallback()
-		}
-
-		m.forwarder.sendCount.Inc()
-	}()
-
-	return promise
 }
 
 func TestDistributorValidation(t *testing.T) {
