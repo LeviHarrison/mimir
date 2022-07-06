@@ -73,11 +73,13 @@ func TestPromiseErrorPropagation(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		promise := NewPromise(time.Second, tc.propagation)
-		promise.setError(testErr)
-		promise.done()
-		gotErr := promise.Error()
-		require.Equal(t, tc.expectErr, gotErr)
+		t.Run(tc.name, func(t *testing.T) {
+			promise := NewPromise(time.Second, tc.propagation)
+			promise.setError(testErr)
+			promise.done()
+			gotErr := promise.Error()
+			require.Equal(t, tc.expectErr, gotErr)
+		})
 	}
 }
 
@@ -115,11 +117,13 @@ func TestPromiseErrAsHTTPGrpc(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		promise := NewPromise(time.Second, true)
-		promise.done()
+		t.Run(tc.name, func(t *testing.T) {
+			promise := NewPromise(time.Second, true)
+			promise.done()
 
-		promise.setError(tc.setErr)
-		gotErr := promise.ErrorAsHTTPGrpc()
-		require.Equal(t, tc.expectErr, gotErr)
+			promise.setError(tc.setErr)
+			gotErr := promise.ErrorAsHTTPGrpc()
+			require.Equal(t, tc.expectErr, gotErr)
+		})
 	}
 }
