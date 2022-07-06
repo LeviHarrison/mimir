@@ -832,7 +832,7 @@ func (d *Distributor) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReq
 	if len(seriesKeys) == 0 && len(metadataKeys) == 0 {
 		if forwardingPromise != nil {
 			// Blocks until the forwarding requests have completed and the final status has been pushed through this chan.
-			err = httpgrpcutil.PrioritizeRecoverableErr([]error{err, firstPartialErr, forwardingPromise.ErrorAsHttpGrpc()}...)
+			err = httpgrpcutil.PrioritizeRecoverableErr(err, firstPartialErr, forwardingPromise.ErrorAsHttpGrpc())
 			if err != nil {
 				return nil, err
 			}
@@ -891,7 +891,7 @@ func (d *Distributor) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReq
 
 	if forwardingPromise != nil {
 		// Blocks until the forwarding requests have completed and the final status has been pushed through this chan.
-		err = httpgrpcutil.PrioritizeRecoverableErr([]error{err, firstPartialErr, forwardingPromise.ErrorAsHttpGrpc()}...)
+		err = httpgrpcutil.PrioritizeRecoverableErr(err, firstPartialErr, forwardingPromise.ErrorAsHttpGrpc())
 	}
 
 	if err != nil {
