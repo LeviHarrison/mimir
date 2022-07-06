@@ -220,7 +220,7 @@ func (s *Promise) Error() error {
 	return s.err
 }
 
-func (s *Promise) ErrorAsHttpGrpc() error {
+func (s *Promise) ErrorAsHTTPGrpc() error {
 	err := s.Error()
 
 	if err == nil {

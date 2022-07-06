@@ -204,7 +204,7 @@ func TestForwardingSamplesWithDifferentErrorsWithPropagation(t *testing.T) {
 			case errNone:
 				require.Nil(t, promise.Error())
 			case errRecoverable, errNonRecoverable:
-				err := promise.ErrorAsHttpGrpc()
+				err := promise.ErrorAsHTTPGrpc()
 				require.NotNil(t, err)
 				resp, ok := httpgrpc.HTTPResponseFromError(err)
 				require.True(t, ok)
