@@ -223,6 +223,10 @@ func (s *Promise) Error() error {
 func (s *Promise) ErrorAsHttpGrpc() error {
 	err := s.Error()
 
+	if err == nil {
+		return err
+	}
+
 	if errors.As(err, &recoverableError{}) {
 		return httpgrpc.Errorf(http.StatusInternalServerError, err.Error())
 	}
