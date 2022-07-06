@@ -18,7 +18,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/weaveworks/common/httpgrpc"
 
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/util/extract"
@@ -42,7 +41,7 @@ type Request interface {
 	Add(sample mimirpb.PreallocTimeseries) bool
 
 	// Send sends the timeseries which have been added to this forwarding request to the according endpoints.
-	// It returns a promise which allows the caller to asynchronously wait for the request to be complete and obtain
+	// It returns a promise which allows the caller to asynchronously wait for the request(s) to be complete and obtain
 	// potential errors resulting from the request(s).
 	Send(ctx context.Context) *Promise
 }
@@ -176,94 +175,9 @@ type recoverableError struct {
 	error
 }
 
-// Promise is used to asynchronously communicate the status and result of a forwarding request.
-type Promise struct {
-	timeout         time.Duration
-	propagateErrors bool
-	doneCh          chan struct{}
-	errMtx          sync.Mutex
-	err             error
-}
-
-func NewPromise(timeout time.Duration, propagateErrors bool) *Promise {
-	return &Promise{
-		propagateErrors: propagateErrors,
-		timeout:         timeout,
-		doneCh:          make(chan struct{}),
-	}
-}
-
-func (s *Promise) Wait() {
-	// awaitTimeout limits for how long AwaitDone can block at twice the forwarding request
-	// timeout, under real-world circumstances this should never be reached because
-	// the forwarding requests themselves get canceled after once the timeout.
-	awaitTimeout := time.NewTimer(2 * s.timeout)
-
-	select {
-	case <-s.doneCh:
-		awaitTimeout.Stop()
-	case <-awaitTimeout.C:
-		s.errMtx.Lock()
-		defer s.errMtx.Unlock()
-
-		s.err = errors.New("timed out while waiting for forwarding request(s)")
-	}
-}
-
-// Error waits until the promise is done and then potentially returns an error or nil.
-func (s *Promise) Error() error {
-	s.Wait()
-
-	s.errMtx.Lock()
-	defer s.errMtx.Unlock()
-
-	return s.err
-}
-
-func (s *Promise) ErrorAsHTTPGrpc() error {
-	err := s.Error()
-
-	if err == nil {
-		return err
-	}
-
-	if errors.As(err, &recoverableError{}) {
-		return httpgrpc.Errorf(http.StatusInternalServerError, err.Error())
-	}
-
-	return httpgrpc.Errorf(http.StatusBadRequest, err.Error())
-}
-
-// done marks the promise as done.
-func (s *Promise) done() {
-	close(s.doneCh)
-}
-
-// setError sets an error as the result of the promise.
-// Recoverable errors overwrite non-recoverable errors, otherwise the first error is kept.
-func (s *Promise) setError(err error) {
-	if err == nil || !s.propagateErrors {
-		return
-	}
-
-	s.errMtx.Lock()
-	defer s.errMtx.Unlock()
-
-	if s.err == nil {
-		s.err = err
-		return
-	}
-
-	if !errors.As(s.err, &recoverableError{}) && errors.As(err, &recoverableError{}) {
-		// If the current error "s.err" is not recoverable and the newly set error "err" is recoverable then we want
-		// to replace s.err with the newly set error because recoverable errors should take precedence.
-		s.err = err
-	}
-
-}
-
 func (r *request) Send(ctx context.Context) *Promise {
-	promise := NewPromise(r.timeout, r.propagateErrors)
+	// Set promise timeout to twice the request timeout, because we want requests to timeout before the promise does.
+	promise := NewPromise(2*r.timeout, r.propagateErrors)
 
 	// Early return if there's no data to send.
 	if len(r.tsByEndpoint) == 0 {
