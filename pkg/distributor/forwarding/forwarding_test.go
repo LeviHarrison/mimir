@@ -65,21 +65,21 @@ func TestForwardingSamplesSuccessfully(t *testing.T) {
 	promise := forwardingReq.Send(context.Background())
 	require.NoError(t, promise.Error())
 
-	for _, req := range append(*reqs1, *reqs2...) {
+	for _, req := range append(reqs1(), reqs2()...) {
 		require.Equal(t, req.Header.Get("Content-Encoding"), "snappy")
 		require.Equal(t, req.Header.Get("Content-Type"), "application/x-protobuf")
 	}
 
-	require.Len(t, *bodies1, 1)
-	receivedReq := decodeBody(t, (*bodies1)[0])
+	require.Len(t, bodies1(), 1)
+	receivedReq := decodeBody(t, (bodies1())[0])
 	require.Len(t, receivedReq.Timeseries, 2)
 	requireLabelsEqual(t, receivedReq.Timeseries[0].Labels, "__name__", "metric1", "some_label", "foo")
 	requireSamplesEqual(t, receivedReq.Timeseries[0].Samples, now, 1)
 	requireLabelsEqual(t, receivedReq.Timeseries[1].Labels, "__name__", "metric1", "some_label", "bar")
 	requireSamplesEqual(t, receivedReq.Timeseries[1].Samples, now, 2)
 
-	require.Len(t, *bodies2, 1)
-	receivedReq = decodeBody(t, (*bodies2)[0])
+	require.Len(t, bodies2(), 1)
+	receivedReq = decodeBody(t, (bodies2())[0])
 	require.Len(t, receivedReq.Timeseries, 2)
 	requireLabelsEqual(t, receivedReq.Timeseries[0].Labels, "__name__", "metric2", "some_label", "foo")
 	requireSamplesEqual(t, receivedReq.Timeseries[0].Samples, now, 3)
@@ -231,6 +231,8 @@ func TestForwardingSamplesWithDifferentErrorsWithPropagation(t *testing.T) {
 }
 
 func newSample(tb testing.TB, time int64, value float64, labelValuePairs ...string) mimirpb.PreallocTimeseries {
+	tb.Helper()
+
 	require.Zero(tb, len(labelValuePairs)%2)
 
 	ts := mimirpb.TimeSeries{
@@ -252,6 +254,8 @@ func newSample(tb testing.TB, time int64, value float64, labelValuePairs ...stri
 }
 
 func requireLabelsEqual(t *testing.T, gotLabels []mimirpb.LabelAdapter, wantLabelValuePairs ...string) {
+	t.Helper()
+
 	require.Zero(t, len(wantLabelValuePairs)%2)
 	require.Equal(t, len(wantLabelValuePairs)/2, len(gotLabels))
 
@@ -262,6 +266,8 @@ func requireLabelsEqual(t *testing.T, gotLabels []mimirpb.LabelAdapter, wantLabe
 }
 
 func requireSamplesEqual(t *testing.T, gotSamples []mimirpb.Sample, wantTimeValuePairs ...int64) {
+	t.Helper()
+
 	require.Zero(t, len(wantTimeValuePairs)%2)
 	require.Equal(t, len(wantTimeValuePairs)/2, len(gotSamples))
 
@@ -271,7 +277,9 @@ func requireSamplesEqual(t *testing.T, gotSamples []mimirpb.Sample, wantTimeValu
 	}
 }
 
-func newTestServer(tb testing.TB, status int, record bool) (string, *[]*http.Request, *[][]byte, func()) {
+func newTestServer(tb testing.TB, status int, record bool) (string, func() []*http.Request, func() [][]byte, func()) {
+	tb.Helper()
+
 	var requests []*http.Request
 	var bodies [][]byte
 	var mtx sync.Mutex
@@ -292,10 +300,26 @@ func newTestServer(tb testing.TB, status int, record bool) (string, *[]*http.Req
 		}),
 	)
 
-	return srv.URL, &requests, &bodies, srv.Close
+	getRequests := func() []*http.Request {
+		mtx.Lock()
+		defer mtx.Unlock()
+
+		return requests
+	}
+
+	getBodies := func() [][]byte {
+		mtx.Lock()
+		defer mtx.Unlock()
+
+		return bodies
+	}
+
+	return srv.URL, getRequests, getBodies, srv.Close
 }
 
 func decodeBody(t *testing.T, body []byte) mimirpb.WriteRequest {
+	t.Helper()
+
 	decompressed, err := snappy.Decode(nil, body)
 	require.NoError(t, err)
 
