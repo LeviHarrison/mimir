@@ -11,7 +11,7 @@ import (
 	"github.com/weaveworks/common/httpgrpc"
 )
 
-var promiseTimeout = errors.New("timed out while waiting for forwarding promise")
+var errPromiseTimeout = errors.New("timed out while waiting for forwarding promise")
 
 // Promise is used to asynchronously communicate the status and result of a forwarding request.
 type Promise struct {
@@ -41,7 +41,7 @@ func (s *Promise) Wait() {
 		s.errMtx.Lock()
 		defer s.errMtx.Unlock()
 
-		s.err = promiseTimeout
+		s.err = errPromiseTimeout
 	}
 }
 

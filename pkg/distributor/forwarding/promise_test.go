@@ -93,7 +93,7 @@ func TestPromiseTimeout(t *testing.T) {
 	require.Greater(t, elapsed, timeout)
 
 	err := promise.Error()
-	require.Equal(t, promiseTimeout, err)
+	require.Equal(t, errPromiseTimeout, err)
 }
 
 func TestPromiseErrAsHTTPGrpc(t *testing.T) {
