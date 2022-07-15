@@ -47,6 +47,7 @@ import (
 	"github.com/grafana/mimir/pkg/util"
 	"github.com/grafana/mimir/pkg/util/globalerror"
 	"github.com/grafana/mimir/pkg/util/httpgrpcutil"
+	util_log "github.com/grafana/mimir/pkg/util/log"
 	util_math "github.com/grafana/mimir/pkg/util/math"
 	"github.com/grafana/mimir/pkg/util/validation"
 )
@@ -595,22 +596,78 @@ func (d *Distributor) forwardingReq(ctx context.Context, userID string) forwardi
 	return d.forwarder.NewRequest(ctx, userID, forwardingRules)
 }
 
+func (d *Distributor) PrePushLimitsHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		// We will report *this* request in the error too.
+		inflight := d.inflightPushRequests.Inc()
+		defer d.inflightPushRequests.Dec()
+
+		if err := d.checkPrePushLimits(ctx, inflight); err != nil {
+			resp, ok := httpgrpc.HTTPResponseFromError(err)
+			if !ok {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if resp.GetCode() != 202 {
+				logger := util_log.WithContext(ctx, util_log.Logger)
+				level.Error(logger).Log("msg", "push error", "err", err)
+			}
+			http.Error(w, string(resp.Body), int(resp.Code))
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// checkPrePushLimits checks limits that can be validated before reading the whole request.
+func (d *Distributor) checkPrePushLimits(ctx context.Context, inflight int64) error {
+	if d.cfg.InstanceLimits.MaxInflightPushRequests > 0 && inflight > int64(d.cfg.InstanceLimits.MaxInflightPushRequests) {
+		return errMaxInflightRequestsReached
+	}
+
+	if d.cfg.InstanceLimits.MaxIngestionRate > 0 {
+		if rate := d.ingestionRate.Rate(); rate >= d.cfg.InstanceLimits.MaxIngestionRate {
+			return errMaxIngestionRateReached
+		}
+	}
+
+	now := mtime.Now()
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return err
+	}
+	if !d.requestRateLimiter.AllowN(now, userID, 1) {
+		validation.DiscardedRequests.WithLabelValues(validation.ReasonRateLimited, userID).Add(1)
+
+		// Return a 429 here to tell the client it is going too fast.
+		// Client may discard the data or slow down and re-send.
+		// Prometheus v2.26 added a remote-write option 'retry_on_http_429'.
+		return httpgrpc.Errorf(http.StatusTooManyRequests, validation.NewRequestRateLimitedError(d.limits.RequestRate(userID), d.limits.RequestBurstSize(userID)).Error())
+	}
+	return nil
+}
+
 // Push implements client.IngesterServer
 func (d *Distributor) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mimirpb.WriteResponse, error) {
-	return d.PushWithCleanup(ctx, req, func() { mimirpb.ReuseSlice(req.Timeseries) })
+	inflight := d.inflightPushRequests.Inc()
+	cleanup := func() {
+		mimirpb.ReuseSlice(req.Timeseries)
+		d.inflightPushRequests.Dec()
+	}
+
+	if err := d.checkPrePushLimits(ctx, inflight); err != nil {
+		cleanup()
+		return nil, err
+	}
+	return d.PushWithCleanup(ctx, req, cleanup)
 }
 
 // PushWithCleanup takes a WriteRequest and distributes it to ingesters using the ring.
 // Strings in `req` may be pointers into the gRPC buffer which will be reused, so must be copied if retained.
-func (d *Distributor) PushWithCleanup(ctx context.Context, req *mimirpb.WriteRequest, callerCleanup func()) (*mimirpb.WriteResponse, error) {
-	// We will report *this* request in the error too.
-	inflight := d.inflightPushRequests.Inc()
-
-	// Decrement counter after all ingester calls have finished or been cancelled.
-	cleanup := func() {
-		callerCleanup()
-		d.inflightPushRequests.Dec()
-	}
+// PushWithCleanup does not check limits like ingestion rate and inflight requests. Use Push to check those.
+func (d *Distributor) PushWithCleanup(ctx context.Context, req *mimirpb.WriteRequest, cleanup func()) (*mimirpb.WriteResponse, error) {
 	cleanupInDefer := true
 	defer func() {
 		if cleanupInDefer {
@@ -627,26 +684,7 @@ func (d *Distributor) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReq
 		span.SetTag("organization", userID)
 	}
 
-	if d.cfg.InstanceLimits.MaxInflightPushRequests > 0 && inflight > int64(d.cfg.InstanceLimits.MaxInflightPushRequests) {
-		return nil, errMaxInflightRequestsReached
-	}
-
-	if d.cfg.InstanceLimits.MaxIngestionRate > 0 {
-		if rate := d.ingestionRate.Rate(); rate >= d.cfg.InstanceLimits.MaxIngestionRate {
-			return nil, errMaxIngestionRateReached
-		}
-	}
-
 	now := mtime.Now()
-	if !d.requestRateLimiter.AllowN(now, userID, 1) {
-		validation.DiscardedRequests.WithLabelValues(validation.ReasonRateLimited, userID).Add(1)
-
-		// Return a 429 here to tell the client it is going too fast.
-		// Client may discard the data or slow down and re-send.
-		// Prometheus v2.26 added a remote-write option 'retry_on_http_429'.
-		return nil, httpgrpc.Errorf(http.StatusTooManyRequests, validation.NewRequestRateLimitedError(d.limits.RequestRate(userID), d.limits.RequestBurstSize(userID)).Error())
-	}
-
 	d.activeUsers.UpdateUserTimestamp(userID, now)
 
 	source := util.GetSourceIPsFromOutgoingCtx(ctx)
