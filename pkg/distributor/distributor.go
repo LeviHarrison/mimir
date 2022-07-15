@@ -596,6 +596,7 @@ func (d *Distributor) forwardingReq(ctx context.Context, userID string) forwardi
 	return d.forwarder.NewRequest(ctx, userID, forwardingRules)
 }
 
+// PrePushLimitsHandler is used as HTTP middleware in front of PushWithCleanup method.
 func (d *Distributor) PrePushLimitsHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -649,7 +650,7 @@ func (d *Distributor) checkPrePushLimits(ctx context.Context, inflight int64) er
 	return nil
 }
 
-// Push implements client.IngesterServer
+// Push is gRPC method registered as client.IngesterServer and distributor.DistributorServer.
 func (d *Distributor) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mimirpb.WriteResponse, error) {
 	inflight := d.inflightPushRequests.Inc()
 	cleanup := func() {
@@ -666,7 +667,8 @@ func (d *Distributor) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mim
 
 // PushWithCleanup takes a WriteRequest and distributes it to ingesters using the ring.
 // Strings in `req` may be pointers into the gRPC buffer which will be reused, so must be copied if retained.
-// PushWithCleanup does not check limits like ingestion rate and inflight requests. Use Push to check those.
+// PushWithCleanup does not check limits like ingestion rate and inflight requests.
+// These limits are checked either by Push gRPC method (when invoked via gRPC) or PrePushLimitsHandler (when invoked via HTTP)
 func (d *Distributor) PushWithCleanup(ctx context.Context, req *mimirpb.WriteRequest, cleanup func()) (*mimirpb.WriteResponse, error) {
 	cleanupInDefer := true
 	defer func() {
