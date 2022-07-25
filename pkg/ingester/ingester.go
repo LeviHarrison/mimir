@@ -607,6 +607,8 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 		failedSamplesCount        = 0
 		succeededExemplarsCount   = 0
 		failedExemplarsCount      = 0
+		succeededHistogramsCount  = 0
+		failedHistogramsCount     = 0
 		startAppend               = time.Now()
 		sampleOutOfBoundsCount    = 0
 		sampleOutOfOrderCount     = 0
@@ -633,6 +635,58 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 	}
 
 	oooTW := i.limits.OutOfOrderTimeWindow(userID)
+
+	handleAppendError := func(err error, timestamp int64, labels []mimirpb.LabelAdapter, copiedLabels labels.Labels) bool {
+		// Check if the error is a soft error we can proceed on. If so, we keep track
+		// of it, so that we can return it back to the distributor, which will return a
+		// 400 error to the client. The client (Prometheus) will not retry on 400, and
+		// we actually ingested all samples which haven't failed.
+		switch cause := errors.Cause(err); cause {
+		case storage.ErrOutOfBounds:
+			sampleOutOfBoundsCount++
+			updateFirstPartial(func() error { return newIngestErrSampleTimestampTooOld(model.Time(timestamp), labels) })
+			return true
+
+		case storage.ErrOutOfOrderSample:
+			sampleOutOfOrderCount++
+			updateFirstPartial(func() error { return newIngestErrSampleOutOfOrder(model.Time(timestamp), labels) })
+			return true
+
+		case storage.ErrTooOldSample:
+			sampleTooOldCount++
+			updateFirstPartial(func() error {
+				return newIngestErrSampleTimestampTooOldOOOEnabled(model.Time(timestamp), labels, oooTW)
+			})
+			return true
+
+		case storage.ErrDuplicateSampleForTimestamp:
+			newValueForTimestampCount++
+			updateFirstPartial(func() error {
+				return newIngestErrSampleDuplicateTimestamp(model.Time(timestamp), labels)
+			})
+			return true
+
+		case errMaxSeriesPerUserLimitExceeded:
+			perUserSeriesLimitCount++
+			updateFirstPartial(func() error { return makeLimitError(perUserSeriesLimit, i.limiter.FormatError(userID, cause)) })
+			return true
+
+		case errMaxSeriesPerMetricLimitExceeded:
+			perMetricSeriesLimitCount++
+			updateFirstPartial(func() error {
+				return makeMetricLimitError(perMetricSeriesLimit, copiedLabels, i.limiter.FormatError(userID, cause))
+			})
+			return true
+		}
+
+		// The error looks an issue on our side, so we should rollback.
+		if rollbackErr := app.Rollback(); rollbackErr != nil {
+			level.Warn(i.logger).Log("msg", "failed to rollback on error", "user", userID, "err", rollbackErr)
+		}
+
+		return false
+	}
+
 	for _, ts := range req.Timeseries {
 		// The labels must be sorted (in our case, it's guaranteed a write request
 		// has sorted labels once hit the ingester).
@@ -642,7 +696,7 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 		// TODO(jesus.vazquez) If we had too many old samples we might want to
 		// extend the fast path to fail early.
 		if oooTW <= 0 && minAppendTimeAvailable &&
-			len(ts.Samples) > 0 && len(ts.Exemplars) == 0 && allOutOfBounds(ts.Samples, minAppendTime) {
+			len(ts.Samples) > 0 && len(ts.Histograms) == 0 && len(ts.Exemplars) == 0 && allOutOfBounds(ts.Samples, minAppendTime) {
 			failedSamplesCount += len(ts.Samples)
 			sampleOutOfBoundsCount += len(ts.Samples)
 
@@ -655,8 +709,8 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 		// Look up a reference for this series.
 		ref, copiedLabels := app.GetRef(mimirpb.FromLabelAdaptersToLabels(ts.Labels))
 
-		// To find out if any sample was added to this series, we keep old value.
-		oldSucceededSamplesCount := succeededSamplesCount
+		// To find out if any sample or histogram was added to this series, we keep old value.
+		oldSucceededCount := succeededSamplesCount + succeededHistogramsCount
 
 		for _, s := range ts.Samples {
 			var err error
@@ -680,59 +734,44 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 
 			failedSamplesCount++
 
-			// Check if the error is a soft error we can proceed on. If so, we keep track
-			// of it, so that we can return it back to the distributor, which will return a
-			// 400 error to the client. The client (Prometheus) will not retry on 400, and
-			// we actually ingested all samples which haven't failed.
-			switch cause := errors.Cause(err); cause {
-			case storage.ErrOutOfBounds:
-				sampleOutOfBoundsCount++
-				updateFirstPartial(func() error { return newIngestErrSampleTimestampTooOld(model.Time(s.TimestampMs), ts.Labels) })
-				continue
-
-			case storage.ErrOutOfOrderSample:
-				sampleOutOfOrderCount++
-				updateFirstPartial(func() error { return newIngestErrSampleOutOfOrder(model.Time(s.TimestampMs), ts.Labels) })
-				continue
-
-			case storage.ErrTooOldSample:
-				sampleTooOldCount++
-				updateFirstPartial(func() error {
-					return newIngestErrSampleTimestampTooOldOOOEnabled(model.Time(s.TimestampMs), ts.Labels, oooTW)
-				})
-				continue
-
-			case storage.ErrDuplicateSampleForTimestamp:
-				newValueForTimestampCount++
-				updateFirstPartial(func() error {
-					return newIngestErrSampleDuplicateTimestamp(model.Time(s.TimestampMs), ts.Labels)
-				})
-				continue
-
-			case errMaxSeriesPerUserLimitExceeded:
-				perUserSeriesLimitCount++
-				updateFirstPartial(func() error { return makeLimitError(perUserSeriesLimit, i.limiter.FormatError(userID, cause)) })
-				continue
-
-			case errMaxSeriesPerMetricLimitExceeded:
-				perMetricSeriesLimitCount++
-				updateFirstPartial(func() error {
-					return makeMetricLimitError(perMetricSeriesLimit, copiedLabels, i.limiter.FormatError(userID, cause))
-				})
+			// If it's a soft error it will be returned back to the distributor later as a 400.
+			if handleAppendError(err, s.TimestampMs, ts.Labels, copiedLabels) {
 				continue
 			}
 
-			// The error looks an issue on our side, so we should rollback
-			if rollbackErr := app.Rollback(); rollbackErr != nil {
-				level.Warn(i.logger).Log("msg", "failed to rollback on error", "user", userID, "err", rollbackErr)
+			// Otherwise, return a 500.
+			return nil, wrapWithUser(err, userID)
+		}
+
+		for _, h := range ts.Histograms {
+			var err error
+
+			if ref != 0 {
+				if _, err = app.AppendHistogram(ref, copiedLabels, h.Timestamp, mimirpb.FromHistogramProtoToHistogram(h)); err == nil {
+					succeededHistogramsCount++
+					continue
+				}
+			} else {
+				copiedLabels = mimirpb.FromLabelAdaptersToLabelsWithCopy(ts.Labels)
+				if ref, err = app.AppendHistogram(0, copiedLabels, h.Timestamp, mimirpb.FromHistogramProtoToHistogram(h)); err == nil {
+					succeededHistogramsCount++
+					continue
+				}
+			}
+
+			failedHistogramsCount++
+
+			if handleAppendError(err, h.Timestamp, ts.Labels, copiedLabels) {
+				continue
 			}
 
 			return nil, wrapWithUser(err, userID)
 		}
 
-		if i.cfg.ActiveSeriesMetricsEnabled && succeededSamplesCount > oldSucceededSamplesCount {
+		if i.cfg.ActiveSeriesMetricsEnabled && succeededSamplesCount+succeededHistogramsCount > oldSucceededCount {
 			db.activeSeries.UpdateSeries(mimirpb.FromLabelAdaptersToLabels(ts.Labels), startAppend, func(l labels.Labels) labels.Labels {
-				// we must already have copied the labels if succeededSamplesCount has been incremented.
+				// we must already have copied the labels if succeededSamplesCount or
+				// succeededHistogramsCount has been incremented.
 				return copiedLabels
 			})
 		}
@@ -777,7 +816,9 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 			otlog.Int("succeededSamplesCount", succeededSamplesCount),
 			otlog.Int("failedSamplesCount", failedSamplesCount),
 			otlog.Int("succeededExemplarsCount", succeededExemplarsCount),
-			otlog.Int("failedExemplarsCount", failedExemplarsCount))
+			otlog.Int("failedExemplarsCount", failedExemplarsCount),
+			otlog.Int("succeededHistogramsCount", succeededHistogramsCount),
+			otlog.Int("failedHistogramsCount", failedHistogramsCount))
 	}
 
 	startCommit := time.Now()
@@ -786,8 +827,8 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 	}
 	i.metrics.appenderCommitDuration.Observe(time.Since(startCommit).Seconds())
 
-	// If only invalid samples are pushed, don't change "last update", as TSDB was not modified.
-	if succeededSamplesCount > 0 {
+	// If only invalid samples and histograms are pushed, don't change "last update", as TSDB was not modified.
+	if succeededSamplesCount+succeededHistogramsCount > 0 {
 		db.setLastUpdate(time.Now())
 	}
 
@@ -798,6 +839,8 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 	i.metrics.ingestedSamplesFail.WithLabelValues(userID).Add(float64(failedSamplesCount))
 	i.metrics.ingestedExemplars.Add(float64(succeededExemplarsCount))
 	i.metrics.ingestedExemplarsFail.Add(float64(failedExemplarsCount))
+	i.metrics.ingestedHistograms.WithLabelValues(userID).Add(float64(succeededHistogramsCount))
+	i.metrics.ingestedHistogramsFail.WithLabelValues(userID).Add(float64(succeededHistogramsCount))
 
 	if sampleOutOfBoundsCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(sampleOutOfBounds, userID).Add(float64(sampleOutOfBoundsCount))
@@ -817,16 +860,16 @@ func (i *Ingester) PushWithCleanup(ctx context.Context, req *mimirpb.WriteReques
 	if perMetricSeriesLimitCount > 0 {
 		validation.DiscardedSamples.WithLabelValues(perMetricSeriesLimit, userID).Add(float64(perMetricSeriesLimitCount))
 	}
-	if succeededSamplesCount > 0 {
-		i.ingestionRate.Add(int64(succeededSamplesCount))
+	if succeededSamplesCount+succeededHistogramsCount > 0 {
+		i.ingestionRate.Add(int64(succeededSamplesCount + succeededHistogramsCount))
 
 		switch req.Source {
 		case mimirpb.RULE:
-			db.ingestedRuleSamples.Add(int64(succeededSamplesCount))
+			db.ingestedRuleSamples.Add(int64(succeededSamplesCount + succeededHistogramsCount))
 		case mimirpb.API:
 			fallthrough
 		default:
-			db.ingestedAPISamples.Add(int64(succeededSamplesCount))
+			db.ingestedAPISamples.Add(int64(succeededSamplesCount + succeededHistogramsCount))
 		}
 	}
 
